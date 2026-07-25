@@ -46,11 +46,16 @@ Usuari demana "crea un document..."
   → DeepSeek classifica com a tasca (tool_choice: sendToAgent)
   → executeTool("sendToAgent", { prompt })
   → Crea Task a Firestore (status: queued)
-  → Crida POST /api/v1/runs a masovera
+  → Crida POST /api/v1/runs a masovera amb session_id=null, agent_name=null, model=null
+    (masovera resol els defaults: crea sessió nova, agent=build, model=standard)
   → Actualitza Task (runId, status: in_progress)
   → pollRun() en background
   → Torna reply "Tasca enviada!"
 ```
+
+**Important:** Xerraire sempre envia `session_id`, `agent_name` i `model` buits.
+Jan pren les decisions. El mode directe (sessió frontend→masovera) envia aquests
+camps omplerts perquè l'usuari els ha triat explícitament.
 
 **3. Post-processing de run (pollRun)**
 ```
