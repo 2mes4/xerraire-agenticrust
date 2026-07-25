@@ -1,5 +1,6 @@
 import express from "express";
 import pg from "pg";
+import { readFileSync, existsSync } from "fs";
 import { initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 
@@ -19,6 +20,54 @@ const pool = new Pool({
 initializeApp();
 const db = getFirestore();
 
+// ─── Load Jan configuration ──────────────────────────────────
+const JAN_CONFIG_PATH = process.env.JAN_CONFIG_PATH || "/etc/xerraire/jan.json";
+let janConfig = { tools: [], taskDetection: { keywords: [], urgencyPhrases: [] }, systemPrompt: "" };
+if (existsSync(JAN_CONFIG_PATH)) {
+  try {
+    janConfig = JSON.parse(readFileSync(JAN_CONFIG_PATH, "utf8"));
+    console.log(`[xerraire] Loaded Jan config from ${JAN_CONFIG_PATH}`);
+  } catch (err) {
+    console.error(`[xerraire] Failed to load Jan config: ${err.message}`);
+  }
+}
+
+const XERRAIRE_TOOLS = (janConfig.tools || []).map(t => ({
+  type: "function",
+  function: {
+    name: t.name,
+    description: t.description,
+    parameters: t.parameters,
+  },
+}));
+
+const taskKw = (janConfig.taskDetection?.keywords || []).join("|");
+const urgencyKw = (janConfig.taskDetection?.urgencyPhrases || []).join("|");
+const TASK_KEYWORDS = taskKw ? new RegExp(`\\b(${taskKw})\\b`, "i") : null;
+const URGENCY_PATTERN = urgencyKw ? new RegExp(`\\b(${urgencyKw})\\b`, "i") : null;
+
+// Fallback tools if config didn't load
+if (XERRAIRE_TOOLS.length === 0) {
+  XERRAIRE_TOOLS.push(
+    { type: "function", function: { name: "sendToAgent", description: "Envia una tasca a l'equip d'agents.", parameters: { type: "object", properties: { prompt: { type: "string", description: "Instruccio completa" } }, required: ["prompt"] } } },
+    { type: "function", function: { name: "searchDocuments", description: "Cerca informacio als documents.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+    { type: "function", function: { name: "createNote", description: "Crea una nota.", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
+    { type: "function", function: { name: "createScheduledTask", description: "Programa una tasca.", parameters: { type: "object", properties: { prompt: { type: "string" }, cron: { type: "string" } }, required: ["prompt", "cron"] } } },
+    { type: "function", function: { name: "createHumanAction", description: "Crea una accio humana.", parameters: { type: "object", properties: { title: { type: "string" }, description: { type: "string" } }, required: ["title", "description"] } } },
+    { type: "function", function: { name: "updateSpace", description: "Actualitza l'espai.", parameters: { type: "object", properties: { name: { type: "string" }, description: { type: "string" } }, required: ["name", "description"] } } },
+    { type: "function", function: { name: "searchMarketplace", description: "Cerca al marketplace.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
+    { type: "function", function: { name: "openSpaceSettings", description: "Obre configuracio.", parameters: { type: "object", properties: {}, required: [] } } },
+    { type: "function", function: { name: "openMarketplace", description: "Obre marketplace.", parameters: { type: "object", properties: { url: { type: "string" } }, required: [] } } },
+  );
+}
+
+function looksLikeTask(message) {
+  if (TASK_KEYWORDS?.test(message)) return true;
+  if (URGENCY_PATTERN?.test(message)) return true;
+  if (/https?:\/\//i.test(message)) return true;
+  return false;
+}
+
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use((req, res, next) => {
@@ -28,27 +77,6 @@ app.use((req, res, next) => {
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
-
-const XERRAIRE_TOOLS = [
-  { type: "function", function: { name: "sendToAgent", description: "Envia una tasca a l'equip d'agents. CRIDA AQUESTA FUNCIO IMMEDIATAMENT quan l'usuari demani que l'equip faci alguna cosa.", parameters: { type: "object", properties: { prompt: { type: "string", description: "Instruccio completa i autonoma pels agents. Escriu una instruccio clara basada en la peticio de l'usuari. Inclou TOTS els detalls: URLs, llistats, codis d'error, dades. No escurcis ni ometis res." } }, required: ["prompt"] } } },
-  { type: "function", function: { name: "searchDocuments", description: "Cerca informacio als documents del projecte.", parameters: { type: "object", properties: { query: { type: "string", description: "Cerca textual" } }, required: ["query"] } } },
-  { type: "function", function: { name: "createNote", description: "Crea una nota per guardar informacio.", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
-  { type: "function", function: { name: "createScheduledTask", description: "Programa una tasca periodica amb cron.", parameters: { type: "object", properties: { prompt: { type: "string" }, cron: { type: "string", description: "Expressio cron" } }, required: ["prompt", "cron"] } } },
-  { type: "function", function: { name: "createHumanAction", description: "Crea una accio pendent per a una persona.", parameters: { type: "object", properties: { title: { type: "string" }, description: { type: "string" } }, required: ["title", "description"] } } },
-  { type: "function", function: { name: "updateSpace", description: "Actualitza el nom i la descripcio de l'espai de treball.", parameters: { type: "object", properties: { name: { type: "string", description: "Nou nom de l'espai" }, description: { type: "string", description: "Nova descripcio de l'espai (missio i activitats)" } }, required: ["name", "description"] } } },
-  { type: "function", function: { name: "searchMarketplace", description: "Cerca equips d'agents al marketplace per recomanar a l'usuari.", parameters: { type: "object", properties: { query: { type: "string", description: "Cerca textual per trobar equips" } }, required: ["query"] } } },
-  { type: "function", function: { name: "openSpaceSettings", description: "Envia l'usuari a la configuracio de l'espai perque connecti el seu repositori d'agents.", parameters: { type: "object", properties: {}, required: [] } } },
-  { type: "function", function: { name: "openMarketplace", description: "Obre el marketplace per a que l'usuari pugui veure els equips d'agents disponibles.", parameters: { type: "object", properties: { url: { type: "string", description: "URL del marketplace (opcional, per defecte la home)" } }, required: [] } } },
-];
-
-const TASK_KEYWORDS = /\b(analitz|analiz|audita?|busca|crea|crear|crea |escriu|escribe|escribir|envia|enviar|envia |fer |genera|generar|genera |modifica|optimitza?|revisa|revisar|revisa |tradueix|traduc|actualitza|actualiza|publica|publicar|programa|planifica|disseny|diseñ|investiga|investigar|escaneja|escanea|indexa|corregeix|corrige|migra|migrar|desplega|deploy|implementa|implementar|refactori|test|prova|probar|optimitz|optimiz|augmenta|millora|mejora|redueix|reduce|extreu|extrae|converteix|convierte|compara|instal·la|instala|configura|set ?up|building|research|optimi[sz]e|writ|generat|draft|publish|schedule|fix|debug|refactor|updat|integrat|build|deploy)\b/i;
-
-function looksLikeTask(message) {
-  if (TASK_KEYWORDS.test(message)) return true;
-  if (/\b(vull|vull que|necessito|necessito que|pots|podries|puedes|puedes |feu|hazme|fer-me|fes|muntat?|posa|pon|investig|busca'm|vull analitzar|quiero que|necesito que|ajuda'm|ayúdame|help me)\b/i.test(message)) return true;
-  if (/https?:\/\//i.test(message)) return true;
-  return false;
-}
 
 async function ensureUser(uid, email, name) {
   try {
@@ -166,32 +194,19 @@ app.post("/chat", async (req, res) => {
     const spaceDesc = description || "";
     const isTask = !isNewSpace && looksLikeTask(message);
 
-    const SYSTEM_PROMPT = `Ets el Jan, l'assistent personal d'aquest espai de treball.
-
-${isNewSpace ? `ATENCIO: Aquest espai es nou o esta buit. L'usuari acaba d'arribar.
-La teva missio ara es:
-1. DONAR LA BENVINGUDA i preguntar com vol anomenar l'espai i per a que el vol utilitzar.
-2. Quan l'usuari respongui, crida updateSpace per desar el nom i la descripcio.
-3. DESPRES pregunta: "Ja tens un equip d'agents o vols que t'ajudi a trobar-ne un?"
-` : `L'espai de treball es diu "${spaceName}" i la seva missio es: ${spaceDesc}`}
+    const basePrompt = janConfig.systemPrompt || `Ets el Jan, l'assistent personal d'aquest espai de treball.
 
 Idioma: Respon sempre en ${language === "ca" ? "catala" : language === "es" ? "castella" : "angles"}.
 
-## REGLA #1 — TASQUES
-Si l'usuari demana que l'equip faci QUALSEVOL cosa (analitzar, crear, modificar, revisar, buscar, generar, etc.), crida sendToAgent IMMEDIATAMENT. NO escriguis text primer.
+Si l'usuari demana que l'equip faci qualsevol cosa, crida sendToAgent immediatament.`;
 
-## REGLA #2 — EL PROMPT HA DE SER COMPLET
-El parametre 'prompt' de sendToAgent ha de contenir TOTA la informacio que l'usuari ha proporcionat:
-- Si l'usuari pasa URLs, llistats, codis d'error o dades -> inclou-ho TOT al prompt
-- Escriu una instruccio clara i autonoma pels agents
-- No escurcis ni omettis res del que l'usuari ha demanat
+    const isNewSpaceNote = isNewSpace ? `\n\nATENCIO: Aquest espai es nou o esta buit. L'usuari acaba d'arribar.
+La teva missio ara es:
+1. DONAR LA BENVINGUDA i preguntar com vol anomenar l'espai i per a que el vol utilitzar.
+2. Quan l'usuari respongui, crida updateSpace per desar el nom i la descripcio.
+3. DESPRES pregunta: "Ja tens un equip d'agents o vols que t'ajudi a trobar-ne un?"` : `\n\nL'espai de treball es diu "${spaceName}" i la seva missio es: ${spaceDesc}`;
 
-## Altres eines
-searchDocuments, createNote, createScheduledTask, createHumanAction, updateSpace, searchMarketplace, openSpaceSettings, openMarketplace.
-
-## Estil
-- Respostes MAXIM 1 frase. Nomes per confirmar que has fet.
-- Si l'usuari repeteix "envia" -> digues "Ja esta enviat!" sense tornar a cridar l'eina.`;
+    const SYSTEM_PROMPT = `${basePrompt}${isNewSpaceNote}`;
 
     await pool.query(`INSERT INTO cf_conversations (user_id, space_id, role, content) VALUES ($1, $2, 'user', $3)`, [uid, spaceId, message]);
 
