@@ -544,7 +544,7 @@ La teva missio ara es:
       { role: "user", content: message },
     ];
 
-    const toolChoice = isTask ? { type: "function", function: { name: "sendToAgent" } } : "auto";
+    const toolChoice = "auto";
 
     let reply = "";
     let pendingActions = [];
@@ -561,7 +561,7 @@ La teva missio ara es:
           tools: XERRAIRE_TOOLS,
           tool_choice: iterations === 1 ? toolChoice : "auto",
           temperature: 0.7,
-          max_tokens: 8000,
+          max_tokens: 12000,
         }),
         signal: AbortSignal.timeout(55000),
       });
