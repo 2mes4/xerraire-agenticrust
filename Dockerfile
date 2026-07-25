@@ -5,6 +5,6 @@ WORKDIR /app
 COPY package.json .
 RUN npm config set registry http://registry.npmjs.org/ && npm config set strict-ssl false && npm install --omit=dev
 
-COPY server.js sereno.js .
+COPY . .
 
 CMD ["node", "server.js"]
