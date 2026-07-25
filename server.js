@@ -11,6 +11,10 @@ const PG_HOST = process.env.PG_HOST || "127.0.0.1";
 const PG_PORT = parseInt(process.env.PG_PORT || "30432");
 const PG_DB = process.env.PG_DB || "studio_agents";
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
+const MASOVERA_URL = process.env.MASOVERA_URL || "http://masovera-api:7878";
+const MASOVERA_KEY = process.env.MASOVERA_API_KEY || "";
+const MASOVERA_TENANT = process.env.MASOVERA_TENANT || "makeyourcrew";
+const MASOVERA_PROJECT_ID = process.env.MASOVERA_PROJECT_ID || "";
 
 const pool = new Pool({
   user: PG_USER, password: PG_PASSWORD, host: PG_HOST, port: PG_PORT, database: PG_DB,
@@ -19,6 +23,193 @@ const pool = new Pool({
 
 initializeApp();
 const db = getFirestore();
+
+// ─── Masovera API client ───────────────────────────────────
+function masoveraHeaders() {
+  const h = { "Content-Type": "application/json" };
+  if (MASOVERA_KEY) h.Authorization = `Bearer ${MASOVERA_KEY}`;
+  return h;
+}
+
+async function masoveraCreateRun({ agentName, model, instruction, branch, sessionId }) {
+  const res = await fetch(`${MASOVERA_URL}/api/v1/runs`, {
+    method: "POST",
+    headers: masoveraHeaders(),
+    body: JSON.stringify({
+      tenant_slug: MASOVERA_TENANT,
+      project_id: MASOVERA_PROJECT_ID,
+      agent_name: agentName || "build",
+      model: model || "standard",
+      instruction,
+      branch: branch || "main",
+      session_id: sessionId || null,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.text().catch(() => "");
+    throw new Error(`masovera ${res.status}: ${err.slice(0, 200)}`);
+  }
+  return res.json();
+}
+
+async function masoveraGetRun(runId) {
+  const res = await fetch(`${MASOVERA_URL}/api/v1/runs/${runId}`, {
+    headers: masoveraHeaders(),
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function masoveraListFiles(projectId) {
+  const res = await fetch(`${MASOVERA_URL}/api/v1/projects/${projectId}/data`, {
+    headers: masoveraHeaders(),
+  });
+  if (!res.ok) return [];
+  const data = await res.json();
+  return Array.isArray(data) ? data : (data.entries || data.files || []);
+}
+
+async function masoveraGetFile(projectId, path) {
+  const res = await fetch(
+    `${MASOVERA_URL}/api/v1/projects/${projectId}/data?path=${encodeURIComponent(path)}`,
+    { headers: masoveraHeaders() }
+  );
+  if (!res.ok) return null;
+  return res.json();
+}
+
+// ─── Sync files from masovera data repo to Firestore ──────
+async function syncDataFilesToFirestore(spaceId, projectId) {
+  const pid = projectId || MASOVERA_PROJECT_ID;
+  if (!pid) return;
+
+  const files = await masoveraListFiles(pid);
+  const filesRef = db.collection("spaces").doc(spaceId).collection("files");
+  const now = new Date().toISOString();
+  let synced = 0;
+
+  for (const file of files) {
+    const filePath = file.path || file.name;
+    if (!filePath) continue;
+    const ext = filePath.split(".").pop()?.toLowerCase();
+    if (["png", "jpg", "jpeg", "gif", "ico", "svg", "pdf", "zip", "tar", "gz"].includes(ext)) continue;
+
+    const fileData = await masoveraGetFile(pid, filePath);
+    if (!fileData) continue;
+
+    let content = fileData.content || "";
+    if (fileData.encoding === "base64") {
+      try { content = Buffer.from(content, "base64").toString("utf8"); } catch {}
+    }
+    if (content.length > 900000) content = content.slice(0, 900000);
+    const fileName = filePath.split("/").pop();
+
+    const existing = await filesRef.where("path", "==", filePath).limit(1).get();
+    if (!existing.empty) {
+      await existing.docs[0].ref.update({
+        name: fileName, content, path: filePath,
+        dirPath: filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "",
+        updated_at: now, type: "blob",
+      });
+    } else {
+      await filesRef.add({
+        name: fileName, content, path: filePath,
+        dirPath: filePath.includes("/") ? filePath.substring(0, filePath.lastIndexOf("/")) : "",
+        updated_at: now, type: "blob",
+      });
+    }
+    synced++;
+  }
+  console.log(`[syncFiles] Synced ${synced} files to Firestore for ${spaceId}`);
+}
+
+// ─── Poll masovera run until completion ───────────────────
+async function pollRun(runId, spaceId, uid, userName, taskRef) {
+  const maxAttempts = 60;
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const run = await masoveraGetRun(runId);
+      if (!run) continue;
+
+      if (run.status === "completed" || run.status === "failed") {
+        console.log(`[poll] Run ${runId} → ${run.status}`);
+
+        // Analyze result with DeepSeek
+        let summary = "";
+        let analysis = {};
+        const lastMsg = run.history?.messages?.slice(-1)?.[0]?.content || "";
+        if (lastMsg) {
+          try {
+            const analysisRes = await fetch("https://api.deepseek.com/chat/completions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
+              body: JSON.stringify({
+                model: "deepseek-chat",
+                messages: [
+                  { role: "system", content: "Analyze the following agent output. Return JSON: { summary: string, needsUserInfo: boolean, shouldCreateNote: boolean, note: string, commit_sha: string }" },
+                  { role: "user", content: lastMsg.slice(0, 4000) },
+                ],
+                response_format: { type: "json_object" },
+                temperature: 0.3, max_tokens: 1000,
+              }),
+              signal: AbortSignal.timeout(15000),
+            });
+            if (analysisRes.ok) {
+              const data = await analysisRes.json();
+              analysis = JSON.parse(data.choices?.[0]?.message?.content || "{}");
+              summary = analysis.summary || "";
+            }
+          } catch (e) {
+            console.warn(`[poll] Analysis error: ${e.message}`);
+          }
+        }
+
+        // Sync data repo files to Firestore (triggers Llull indexing)
+        await syncDataFilesToFirestore(spaceId, run.project_id).catch(e =>
+          console.warn(`[poll] File sync error: ${e.message}`)
+        );
+
+        // Update task in Firestore
+        if (taskRef) {
+          const update = {
+            status: run.status === "completed" ? "done" : "error",
+            completed_at: new Date().toISOString(),
+            commit_sha: run.commit_sha || analysis.commit_sha || null,
+            analysis,
+          };
+          await taskRef.update(update);
+        }
+
+        // Create note if analysis says so
+        if (analysis.shouldCreateNote && analysis.note) {
+          await db.collection("spaces").doc(spaceId).collection("notes").add({
+            text: analysis.note,
+            userId: uid,
+            userName: userName,
+            source: "run_analysis",
+            runId,
+            createdAt: new Date().toISOString(),
+          }).catch(() => {});
+        }
+
+        // Store run analysis
+        await db.collection("masovera_runs").doc(runId).set({
+          status: run.status,
+          summary,
+          analysis,
+          commit_sha: run.commit_sha || null,
+          updated_at: new Date().toISOString(),
+        }, { merge: true }).catch(() => {});
+
+        return;
+      }
+    } catch (e) {
+      console.warn(`[poll] Attempt ${i}: ${e.message}`);
+    }
+  }
+  console.warn(`[poll] Run ${runId} timed out after ${maxAttempts * 3}s`);
+}
 
 // ─── Load Jan configuration ──────────────────────────────────
 const JAN_CONFIG_PATH = process.env.JAN_CONFIG_PATH || "/etc/xerraire/jan.json";
@@ -89,6 +280,58 @@ async function ensureUser(uid, email, name) {
 async function executeTool(name, args, spaceId, uid, userName, pendingActions) {
   switch (name) {
     case "sendToAgent": {
+      // Crida masovera directament i crea kanban task
+      if (MASOVERA_PROJECT_ID) {
+        try {
+          // Crear task a Firestore
+          const taskRef = db.collection("spaces").doc(spaceId).collection("tasks").doc();
+          const taskData = {
+            prompt: args.prompt,
+            agent: "build",
+            model: "standard",
+            masoveraProjectId: MASOVERA_PROJECT_ID,
+            userId: uid,
+            userName: userName || "",
+            title: (args.prompt || "").slice(0, 60),
+            status: "queued",
+            createdAt: new Date().toISOString(),
+          };
+          await taskRef.set(taskData);
+
+          // Cridar masovera
+          const run = await masoveraCreateRun({
+            agentName: "build",
+            model: "standard",
+            instruction: args.prompt,
+            branch: "main",
+            sessionId: null,
+          });
+
+          // Actualitzar task amb run
+          await taskRef.update({
+            runId: run.run_id,
+            masoveraRunId: run.run_id,
+            masoveraSessionId: run.session_id || null,
+            status: "in_progress",
+          });
+
+          // Poll completat en background
+          pollRun(run.run_id, spaceId, uid, userName, taskRef).catch(e =>
+            console.error(`[sendToAgent] Poll failed: ${e.message}`)
+          );
+
+          return {
+            ok: true,
+            runId: run.run_id,
+            message: "Tasca enviada a l'equip. Et notificaré quan estigui feta.",
+          };
+        } catch (e) {
+          console.error(`[sendToAgent] Masovera error: ${e.message}`);
+          return { error: `No s'ha pogut enviar la tasca: ${e.message}` };
+        }
+      }
+
+      // Fallback: sense project ID, demanar confirmació
       pendingActions.push({
         type: "confirm_send_to_agent",
         prompt: args.prompt,
@@ -167,9 +410,35 @@ app.post("/confirm-task", async (req, res) => {
       : "✅ Enviat! L'equip hi està treballant.";
 
     await db.collection("spaces").doc(spaceId).collection("messages").add({
-      prompt, agent: "jan", source: "chat", status: "pending",
-      userId: uid, userName: name || "", createdAt: new Date().toISOString(),
+      role: "user", text: prompt,
+      userId: uid, userName: name || "", status: "handled",
+      createdAt: new Date().toISOString(),
     });
+
+    // If masovera is configured, create run + poll
+    if (MASOVERA_PROJECT_ID) {
+      const taskRef = db.collection("spaces").doc(spaceId).collection("tasks").doc();
+      const taskData = {
+        prompt, agent: "build", model: "standard",
+        masoveraProjectId: MASOVERA_PROJECT_ID,
+        userId: uid, userName: name || "",
+        title: prompt.slice(0, 60), status: "queued",
+        createdAt: new Date().toISOString(),
+      };
+      await taskRef.set(taskData);
+
+      const run = await masoveraCreateRun({
+        agentName: "build", model: "standard",
+        instruction: prompt, branch: "main", sessionId: null,
+      });
+      await taskRef.update({
+        runId: run.run_id, masoveraRunId: run.run_id,
+        masoveraSessionId: run.session_id || null, status: "in_progress",
+      });
+      pollRun(run.run_id, spaceId, uid, name, taskRef).catch(e =>
+        console.error(`[confirm-task] Poll failed: ${e.message}`)
+      );
+    }
 
     await pool.query(
       `INSERT INTO cf_conversations (user_id, space_id, role, content) VALUES ($1, $2, 'user', $3), ($1, $2, 'assistant', $4)`,
@@ -207,6 +476,17 @@ La teva missio ara es:
 3. DESPRES pregunta: "Ja tens un equip d'agents o vols que t'ajudi a trobar-ne un?"` : `\n\nL'espai de treball es diu "${spaceName}" i la seva missio es: ${spaceDesc}`;
 
     const SYSTEM_PROMPT = `${basePrompt}${isNewSpaceNote}`;
+
+    // Save user message to Firestore so frontend sees it
+    await db.collection("spaces").doc(spaceId).collection("messages").add({
+      role: "user",
+      text: message,
+      uid,
+      userName: name || "",
+      status: "handled",
+      language: language || "ca",
+      createdAt: new Date().toISOString(),
+    }).catch(() => {});
 
     await pool.query(`INSERT INTO cf_conversations (user_id, space_id, role, content) VALUES ($1, $2, 'user', $3)`, [uid, spaceId, message]);
 
@@ -270,6 +550,15 @@ La teva missio ara es:
     }
 
     await pool.query(`INSERT INTO cf_conversations (user_id, space_id, role, content) VALUES ($1, $2, 'assistant', $3)`, [uid, spaceId, reply]);
+
+    // Save bot reply to Firestore
+    await db.collection("spaces").doc(spaceId).collection("messages").add({
+      role: "bot",
+      text: reply || "Fet!",
+      uid,
+      language: language || "ca",
+      createdAt: new Date().toISOString(),
+    }).catch(() => {});
     
     res.json({ reply, actions: pendingActions.length > 0 ? pendingActions : undefined });
   } catch (err) {
