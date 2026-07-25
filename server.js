@@ -3,6 +3,7 @@ import pg from "pg";
 import { readFileSync, existsSync } from "fs";
 import { initializeApp } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
+import { Tracer, LogLevel } from "./sereno.js";
 
 const { Pool } = pg;
 const PG_USER = process.env.PG_USER || "studio";
@@ -125,6 +126,12 @@ async function syncDataFilesToFirestore(spaceId, projectId) {
 
 // ─── Poll masovera run until completion ───────────────────
 async function pollRun(runId, spaceId, uid, userName, taskRef) {
+  const trace = Tracer.root("xerraire", "jan");
+  const pollStart = Date.now();
+  trace.emit(LogLevel.Info, "polling masovera run", {
+    action_type: "lifecycle", action_name: "poll_start",
+    tool_args: { run_id: runId, space_id: spaceId },
+  });
   const maxAttempts = 60;
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise(r => setTimeout(r, 3000));
@@ -202,6 +209,13 @@ async function pollRun(runId, spaceId, uid, userName, taskRef) {
           updated_at: new Date().toISOString(),
         }, { merge: true }).catch(() => {});
 
+        const totalPollMs = Date.now() - pollStart;
+        trace.emit(LogLevel.Info, "run polling complete", {
+          action_type: "lifecycle", action_name: "poll_complete",
+          latency_ms: totalPollMs,
+          tool_args: { run_id: runId, status: run.status, attempts: i + 1 },
+        });
+
         return;
       }
     } catch (e) {
@@ -277,11 +291,12 @@ async function ensureUser(uid, email, name) {
   }
 }
 
-async function executeTool(name, args, spaceId, uid, userName, pendingActions) {
+async function executeTool(name, args, spaceId, uid, userName, pendingActions, serenoTrace) {
   switch (name) {
     case "sendToAgent": {
       // Crida masovera directament i crea kanban task
       if (MASOVERA_PROJECT_ID) {
+        const start = Date.now();
         try {
           // Crear task a Firestore
           const taskRef = db.collection("spaces").doc(spaceId).collection("tasks").doc();
@@ -320,12 +335,24 @@ async function executeTool(name, args, spaceId, uid, userName, pendingActions) {
             console.error(`[sendToAgent] Poll failed: ${e.message}`)
           );
 
+          const elapsed = Date.now() - start;
+          serenoTrace?.emit(LogLevel.Info, "masovera run created", {
+            action_type: "tool_execution", action_name: "masovera.createRun",
+            latency_ms: elapsed,
+            tool_args: { run_id: run.run_id, session_id: run.session_id },
+          });
+
           return {
             ok: true,
             runId: run.run_id,
             message: "Tasca enviada a l'equip. Et notificaré quan estigui feta.",
           };
         } catch (e) {
+          serenoTrace?.emit(LogLevel.Error, "masovera run failed", {
+            action_type: "tool_execution", action_name: "masovera.createRun",
+            error: { type: "MasoveraError", message: e.message },
+            latency_ms: Date.now() - start,
+          });
           console.error(`[sendToAgent] Masovera error: ${e.message}`);
           return { error: `No s'ha pogut enviar la tasca: ${e.message}` };
         }
@@ -399,9 +426,18 @@ async function executeTool(name, args, spaceId, uid, userName, pendingActions) {
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/confirm-task", async (req, res) => {
+  const trace = Tracer.root("xerraire", "jan");
+  trace.emit(LogLevel.Info, "confirm-task received", {
+    action_type: "tool_execution", action_name: "sendToAgent",
+    user_id: req.body?.uid, session_id: req.body?.spaceId,
+  });
+
   try {
     const { prompt, uid, spaceId, email, name, language } = req.body;
-    if (!prompt || !uid || !spaceId) return res.status(400).json({ error: "prompt, uid and spaceId required" });
+    if (!prompt || !uid || !spaceId) {
+      trace.emit(LogLevel.Warn, "confirm-task missing fields");
+      return res.status(400).json({ error: "prompt, uid and spaceId required" });
+    }
 
     await ensureUser(uid, email, name);
 
@@ -453,9 +489,19 @@ app.post("/confirm-task", async (req, res) => {
 });
 
 app.post("/chat", async (req, res) => {
+  const trace = Tracer.root("xerraire", "jan");
+  const startTime = Date.now();
+  trace.emit(LogLevel.Info, "chat request received", {
+    action_type: "lifecycle", action_name: "chat_request",
+    user_id: req.body?.uid, session_id: req.body?.spaceId,
+  });
+
   try {
     const { message, uid, spaceId, agentRole, language, email, name, spaceName, description } = req.body;
-    if (!message || !uid || !spaceId) return res.status(400).json({ error: "message, uid and spaceId required" });
+    if (!message || !uid || !spaceId) {
+      trace.emit(LogLevel.Warn, "missing required fields", { error: { type: "ValidationError" } });
+      return res.status(400).json({ error: "message, uid and spaceId required" });
+    }
 
     await ensureUser(uid, email, name);
 
@@ -505,7 +551,8 @@ La teva missio ara es:
     let iterations = 0;
     while (iterations < 5) {
       iterations++;
-      const response = await fetch("https://api.deepseek.com/chat/completions", {
+      const deepseekStart = Date.now();
+    const response = await fetch("https://api.deepseek.com/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
         body: JSON.stringify({
@@ -517,6 +564,12 @@ La teva missio ara es:
           max_tokens: 8000,
         }),
         signal: AbortSignal.timeout(55000),
+      });
+      const deepseekLatency = Date.now() - deepseekStart;
+      trace.emit(LogLevel.Debug, "DeepSeek call completed", {
+        action_type: "llm_inference", action_name: "deepseek-chat",
+        latency_ms: deepseekLatency,
+        model: "deepseek-chat",
       });
       if (!response.ok) return res.status(502).json({ error: `DeepSeek error: ${response.status}` });
 
@@ -532,7 +585,7 @@ La teva missio ara es:
           let result;
           try {
             const args = JSON.parse(tc.function.arguments);
-            result = await executeTool(tc.function.name, args, spaceId, uid, name, pendingActions);
+            result = await executeTool(tc.function.name, args, spaceId, uid, name, pendingActions, trace);
           } catch (toolErr) {
             result = { error: toolErr.message };
           }
@@ -560,8 +613,19 @@ La teva missio ara es:
       createdAt: new Date().toISOString(),
     }).catch(() => {});
     
+    const totalLatency = Date.now() - startTime;
+    trace.emit(LogLevel.Info, "chat response sent", {
+      action_type: "lifecycle", action_name: "chat_response",
+      latency_ms: totalLatency,
+    });
+
     res.json({ reply, actions: pendingActions.length > 0 ? pendingActions : undefined });
   } catch (err) {
+    trace.emit(LogLevel.Error, "chat error", {
+      action_type: "lifecycle",
+      error: { type: "ChatError", message: err.message },
+      latency_ms: Date.now() - startTime,
+    });
     console.error("[xerraire] error:", err.message);
     res.status(500).json({ error: err.message });
   }
