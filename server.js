@@ -152,7 +152,7 @@ async function pollRun(runId, spaceId, uid, userName, taskRef) {
               method: "POST",
               headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
               body: JSON.stringify({
-                model: "deepseek-chat",
+                model: "deepseek-v4-flash",
                 messages: [
                   { role: "system", content: "Analyze the following agent output. Return JSON: { summary: string, needsUserInfo: boolean, shouldCreateNote: boolean, note: string, commit_sha: string }" },
                   { role: "user", content: lastMsg.slice(0, 4000) },
@@ -556,7 +556,7 @@ La teva missio ara es:
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${DEEPSEEK_API_KEY}` },
         body: JSON.stringify({
-          model: "deepseek-chat",
+          model: "deepseek-v4-flash",
           messages: apiMessages,
           tools: XERRAIRE_TOOLS,
           tool_choice: iterations === 1 ? toolChoice : "auto",
